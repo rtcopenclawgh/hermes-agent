@@ -1739,10 +1739,25 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
     """
     stripped: Dict[str, Any] = {"pool": [], "providers": [], "files": []}
     profile_dir = Path(profile_dir)
+    # Same-file guard as the heal path: when the target's credential files are
+    # symlinks/hardlinks to the global root, "stripping the clone" would delete
+    # the root's own grant. A store that IS the root is by definition not a
+    # forked copy, so there is nothing to strip (2026-09-03 incident).
+    _root_auth = _global_auth_file_path()
+    if _root_auth is None:
+        try:
+            from hermes_constants import get_default_hermes_root
+            _root_auth = get_default_hermes_root() / "auth.json"
+        except Exception:
+            _root_auth = None
+    if _root_auth is not None and _same_path(profile_dir / "auth.json", _root_auth):
+        return stripped
     for name in SINGLE_USE_OAUTH_SINGLETON_FILES:
         try:
             target = profile_dir / name
             if target.is_file() or target.is_symlink():
+                if _root_auth is not None and _same_path(target, _root_auth.parent / name):
+                    continue
                 target.unlink()
                 stripped["files"].append(name)
         except OSError:
@@ -1987,6 +2002,15 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         if real_home_env and _same_path(root_path, Path(real_home_env) / ".hermes" / "auth.json"):
             return None
     profile_path = _auth_file_path()
+    # A profile whose auth.json is a SYMLINK (or hardlink) to the root store is
+    # not a fork: it is the SAME file, so root and profile trivially share
+    # lineage (same pool id, same account identity, same token material). The
+    # heal would "consolidate" that single credential by stripping the
+    # profile's copy — which IS the root's file — destroying the only grant.
+    # Observed on 2026-09-03: profiles/functional/auth.json -> ../../auth.json
+    # made every profile-mode job delete openai-codex from ~/.hermes/auth.json.
+    if _same_path(profile_path, root_path):
+        return None
     profile_home = profile_path.parent
     root_home = root_path.parent
     profile_singleton = profile_home / ".anthropic_oauth.json" if provider_id == "anthropic" else None
