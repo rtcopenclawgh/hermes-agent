@@ -1434,6 +1434,75 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
+def _parse_auth_updated_at(value: Any) -> Optional[datetime]:
+    """Parse auth.json ``updated_at``; unknown/missing values sort as unknown."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _merge_newer_disk_auth(incoming: Dict[str, Any], disk: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep credentials written to disk after ``incoming`` was loaded.
+
+    Lost-update: process A loads auth.json (xAI only), process B adds
+    openai-codex, process A refreshes xAI and saves its stale snapshot —
+    Codex vanishes even though ``active_provider`` still says openai-codex.
+    Logout stays correct: the snapshot and the file share ``updated_at``, so
+    this is a no-op and the deleted provider stays deleted.
+    """
+    disk_ts = _parse_auth_updated_at(disk.get("updated_at"))
+    incoming_ts = _parse_auth_updated_at(incoming.get("updated_at"))
+    if disk_ts is None:
+        return incoming
+    if incoming_ts is not None and disk_ts <= incoming_ts:
+        return incoming
+
+    in_providers = incoming.get("providers")
+    if not isinstance(in_providers, dict):
+        in_providers = {}
+        incoming["providers"] = in_providers
+    disk_providers = disk.get("providers")
+    if not isinstance(disk_providers, dict):
+        disk_providers = {}
+    for provider_id, state in disk_providers.items():
+        if provider_id not in in_providers:
+            in_providers[provider_id] = state
+
+    in_pool = incoming.get("credential_pool")
+    if not isinstance(in_pool, dict):
+        in_pool = {}
+        incoming["credential_pool"] = in_pool
+    disk_pool = disk.get("credential_pool")
+    if not isinstance(disk_pool, dict):
+        disk_pool = {}
+    for provider_id, entries in disk_pool.items():
+        if provider_id not in in_pool:
+            in_pool[provider_id] = entries
+            continue
+        if not isinstance(entries, list) or not isinstance(in_pool.get(provider_id), list):
+            continue
+        seen_ids = {
+            entry.get("id")
+            for entry in in_pool[provider_id]
+            if isinstance(entry, dict) and entry.get("id")
+        }
+        for entry in entries:
+            entry_id = entry.get("id") if isinstance(entry, dict) else None
+            if entry_id and entry_id not in seen_ids:
+                in_pool[provider_id].append(entry)
+                seen_ids.add(entry_id)
+    return incoming
+
+
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
     # target_path=None preserves the existing contract (write the active
     # store at _auth_file_path()). An explicit path lets callers persist a
@@ -1447,6 +1516,12 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # secure_parent_dir refuses to chmod /, top-level dirs, or the
     # hermes-agent install tree (#25821, #93050).
     secure_parent_dir(auth_file)
+    # Re-read disk before stamping a new updated_at. A stale in-memory
+    # snapshot must not clobber a concurrent login (openai-codex wiped by
+    # an xAI refresh on 2026-09-02).
+    if auth_file.exists():
+        disk = _load_auth_store(auth_file)
+        _merge_newer_disk_auth(auth_store, disk)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
