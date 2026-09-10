@@ -780,10 +780,85 @@ def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **du
     atomic_json_write(target, data, mode=0o600, fsync_dir=fsync_dir, **dump_kwargs)
 
 
+def _parse_auth_updated_at(value: Any) -> Optional[datetime]:
+    """Parse auth.json ``updated_at``; unknown/missing values sort as unknown."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _merge_newer_disk_auth(incoming: dict[str, Any], disk: dict[str, Any]) -> dict[str, Any]:
+    """Keep credentials written to disk after ``incoming`` was loaded.
+
+    Lost-update: process A loads auth.json (xAI only), process B adds
+    openai-codex, process A refreshes xAI and saves its stale snapshot —
+    Codex vanishes even though ``active_provider`` still says openai-codex.
+    Logout stays correct: the snapshot and the file share ``updated_at``, so
+    this is a no-op and the deleted provider stays deleted.
+    """
+    disk_ts = _parse_auth_updated_at(disk.get("updated_at"))
+    incoming_ts = _parse_auth_updated_at(incoming.get("updated_at"))
+    if disk_ts is None:
+        return incoming
+    if incoming_ts is not None and disk_ts <= incoming_ts:
+        return incoming
+
+    in_providers = incoming.get("providers")
+    if not isinstance(in_providers, dict):
+        in_providers = {}
+        incoming["providers"] = in_providers
+    disk_providers = disk.get("providers")
+    if not isinstance(disk_providers, dict):
+        disk_providers = {}
+    for provider_id, state in disk_providers.items():
+        if provider_id not in in_providers:
+            in_providers[provider_id] = state
+
+    in_pool = incoming.get("credential_pool")
+    if not isinstance(in_pool, dict):
+        in_pool = {}
+        incoming["credential_pool"] = in_pool
+    disk_pool = disk.get("credential_pool")
+    if not isinstance(disk_pool, dict):
+        disk_pool = {}
+    for provider_id, entries in disk_pool.items():
+        if provider_id not in in_pool:
+            in_pool[provider_id] = entries
+            continue
+        if not isinstance(entries, list) or not isinstance(in_pool.get(provider_id), list):
+            continue
+        seen_ids = {
+            entry.get("id")
+            for entry in in_pool[provider_id]
+            if isinstance(entry, dict) and entry.get("id")
+        }
+        for entry in entries:
+            entry_id = entry.get("id") if isinstance(entry, dict) else None
+            if entry_id and entry_id not in seen_ids:
+                in_pool[provider_id].append(entry)
+                seen_ids.add(entry_id)
+    return incoming
+
+
 def _save_auth_store(auth_store: dict[str, Any], target_path: Optional[Path] = None) -> Path:
     """Atomically persist *auth_store* (0o600, parent tightened to 0o700) to the active store, or to
     an explicit *target_path* (e.g. the global-root write-through for rotating xAI OAuth grants)."""
     auth_file = target_path if target_path is not None else _auth_file_path()
+    # Re-read disk before stamping a new updated_at. A stale in-memory
+    # snapshot must not clobber a concurrent login (openai-codex wiped by
+    # an xAI refresh on 2026-09-02).
+    if auth_file.exists():
+        disk = _load_auth_store(auth_file)
+        _merge_newer_disk_auth(auth_store, disk)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(UTC).isoformat()
     _save_private_json(auth_file, auth_store, fsync_dir=True)
