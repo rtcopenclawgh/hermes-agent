@@ -25,7 +25,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
-from agent.runtime_cwd import resolve_context_cwd
+from agent.runtime_cwd import _is_install_tree, resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
 
@@ -584,16 +584,26 @@ def _post_workspace_parts(agent: Any) -> List[str]:
 
 
 def _context_files_part(agent: Any, ctx_len: Optional[int], soul_loaded: bool) -> List[str]:
-    """Project context files (AGENTS.md etc.) for the context tier. TERMINAL_CWD
-    when set (gateway); None lets discovery fall back to the launch dir.  The
-    install-tree fallback is only legitimate for cli/tui where the launch dir
-    IS the user's shell cwd; desktop-pinned launch dirs are treated as the
-    fallback they really are so the guard can reject Hermes's bundled AGENTS.md."""
+    """Project context files (AGENTS.md etc.) for the context tier.
+
+    ``TERMINAL_CWD`` / ``terminal.cwd`` is the configured workspace. Desktop
+    launch dirs are not a workspace: if a real configured cwd exists and is
+    not the Hermes install tree, use it (same file Discord/gateway inject).
+    Otherwise pass ``cwd=None`` so the install-tree guard can reject bundled
+    ``AGENTS.md``. CLI/TUI may still fall back to the shell cwd.
+    """
     if agent.skip_context_files:
         return []
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
+    configured = resolve_context_cwd()
+    if launch_artifact and configured is not None and not _is_install_tree(Path(configured)):
+        cwd: Optional[str] = str(configured)
+    elif launch_artifact:
+        cwd = None
+    else:
+        cwd = str(configured) if configured is not None else None
     return [_pb.build_context_files_prompt(
-        cwd=None if launch_artifact else resolve_context_cwd(), skip_soul=soul_loaded, context_length=ctx_len,
+        cwd=cwd, skip_soul=soul_loaded, context_length=ctx_len,
         allow_install_tree_fallback=agent.platform in ("cli", "tui"), home_override=_agent_home(agent))]
 
 

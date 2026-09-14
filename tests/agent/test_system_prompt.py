@@ -88,7 +88,7 @@ class TestContextFileCwd:
 
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        assert _captured_context_cwd(_make_agent()) == tmp_path
+        assert Path(_captured_context_cwd(_make_agent())) == tmp_path
 
     def test_desktop_launch_artifact_does_not_load_bundled_agents_md(
         self, monkeypatch, tmp_path
@@ -133,6 +133,35 @@ class TestContextFileCwd:
             context = build_system_prompt_parts(agent)["context"]
 
         assert "chosen workspace instructions" in context
+
+    def test_desktop_launch_artifact_uses_configured_terminal_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        import agent.runtime_cwd as runtime_cwd
+
+        install = tmp_path / "hermes-agent"
+        install.mkdir()
+        (install / "AGENTS.md").write_text("bundled contributor instructions")
+        workspace = tmp_path / "vault"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("vault project instructions")
+
+        monkeypatch.setattr(runtime_cwd, "_PACKAGE_ROOT", install.resolve())
+        monkeypatch.chdir(install)
+
+        agent = _make_agent(
+            platform="desktop",
+            _context_cwd_is_launch_artifact=True,
+        )
+        with (
+            patch("agent.prompt_builder.load_soul_md", return_value=""),
+            patch("agent.prompt_builder.build_environment_hints", return_value=""),
+            patch("agent.system_prompt.resolve_context_cwd", return_value=workspace),
+        ):
+            context = build_system_prompt_parts(agent)["context"]
+
+        assert "vault project instructions" in context
+        assert "bundled contributor instructions" not in context
 
 
 def _stable_prompt(agent):
